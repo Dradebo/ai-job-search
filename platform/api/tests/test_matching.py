@@ -188,6 +188,23 @@ class ProfileDrivenMatchingTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
 
+    def test_kampala_it_graduate_matches_uganda_roles_and_location(self) -> None:
+        match = listing(
+            profile={
+                "target_industries": ["Information Technology"],
+                "target_locations": ["Kampala", "Uganda"],
+                "work_mode": "hybrid",
+            },
+            title="IT Support Assistant - Graduate",
+            company="Kampala Community Services",
+            location="Hybrid - Kampala, Uganda",
+            body="Provide ICT and computer support to staff. Suitable for a recent IT course graduate.",
+            role="IT Support",
+        )
+
+        self.assertIsNotNone(match)
+        self.assertEqual(match["work_mode"], "hybrid")
+
     def test_accountant_role_matches_in_canada(self) -> None:
         match = listing(
             profile={
