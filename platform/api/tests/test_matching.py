@@ -71,6 +71,7 @@ except ModuleNotFoundError as error:
     })
 
 from app.main import (  # noqa: E402
+    automated_source_labels,
     configured_greenhouse_sources,
     normalize_listing,
     search_himalayas,
@@ -262,6 +263,16 @@ class ProfileDrivenMatchingTests(unittest.TestCase):
 
         self.assertEqual([slug for slug, _ in sources], ["cdc", "world-bank"])
         self.assertTrue(all("boards-api.greenhouse.io/v1/boards/" in url for _, url in sources))
+
+    @patch.dict(os.environ, {"GREENHOUSE_BOARDS": ""})
+    @patch("app.main.USAJOBS_USER_AGENT", "")
+    @patch("app.main.USAJOBS_API_KEY", "")
+    def test_coverage_reports_remote_feeds_only_when_the_search_can_use_them(self) -> None:
+        self.assertEqual(automated_source_labels("on-site"), [])
+        self.assertEqual(
+            automated_source_labels("any"),
+            ["Jobicy (remote jobs)", "Himalayas (remote jobs)", "Remotive (remote jobs)"],
+        )
 
     @patch("app.main.urlopen")
     @patch("app.main.USAJOBS_USER_AGENT", "applicant@example.org")
