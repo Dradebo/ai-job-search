@@ -414,6 +414,7 @@ class InviteOnlyRegistrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.inviter_patch.stop()
         with db_lock:
+            db.execute("DELETE FROM users WHERE email = ?", (self.friend_email,))
             db.execute("DELETE FROM users WHERE id = ?", (self.owner_id,))
             db.commit()
 
@@ -477,6 +478,11 @@ class InviteOnlyRegistrationTests(unittest.TestCase):
         with self.assertRaises(Exception) as wrong_origin:
             register(payload, object(), origin="https://attacker.test")
         self.assertEqual(wrong_origin.exception.status_code, 403)
+
+        mismatched_email = RegisterRequest(email="someone-else@example.org", display_name="Friend", password="a-long-test-password", invite_token=token)
+        with self.assertRaises(Exception) as mismatch:
+            register(mismatched_email, object(), origin=self.origin)
+        self.assertEqual(mismatch.exception.status_code, 400)
 
         register(payload, type("Response", (), {"set_cookie": lambda *args, **kwargs: None})(), origin=self.origin)
         with self.assertRaises(Exception) as reused:
