@@ -9,6 +9,7 @@ import json
 from types import ModuleType
 import unittest
 from unittest.mock import patch
+from uuid import uuid4
 from urllib.parse import parse_qs, urlparse
 
 
@@ -45,7 +46,10 @@ except ModuleNotFoundError as error:
         get = post = put = delete = _route
 
     class _HTTPException(Exception):
-        pass
+        def __init__(self, status_code=500, detail=None, **kwargs) -> None:
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
 
     fastapi_module = ModuleType("fastapi")
     fastapi_module.__path__ = []
@@ -53,6 +57,7 @@ except ModuleNotFoundError as error:
     fastapi_module.Depends = lambda *args, **kwargs: None
     fastapi_module.FastAPI = _FastAPI
     fastapi_module.File = lambda *args, **kwargs: None
+    fastapi_module.Header = lambda *args, **kwargs: None
     fastapi_module.HTTPException = _HTTPException
     fastapi_module.Response = _Response
     fastapi_module.UploadFile = type("UploadFile", (), {})
@@ -71,12 +76,21 @@ except ModuleNotFoundError as error:
     })
 
 from app.main import (  # noqa: E402
+    InvitationCreate,
+    RegisterRequest,
     automated_source_labels,
     configured_greenhouse_sources,
+    create_invitation,
+    db,
+    db_lock,
+    hash_password,
+    me,
     normalize_listing,
+    register,
     search_himalayas,
     search_jobicy,
     search_usajobs,
+    session_hash,
 )
 
 
@@ -378,6 +392,109 @@ class ProfileDrivenMatchingTests(unittest.TestCase):
 
         self.assertNotIn("country", parameters)
         self.assertEqual(parameters["worldwide"], ["true"])
+
+
+class InviteOnlyRegistrationTests(unittest.TestCase):
+    origin = "http://localhost:3000"
+
+    def setUp(self) -> None:
+        self.owner_email = f"owner-{uuid4().hex}@example.org"
+        self.friend_email = f"friend-{uuid4().hex}@example.org"
+        with db_lock:
+            cursor = db.execute(
+                "INSERT INTO users (email, password_hash, display_name, created_at) VALUES (?, ?, ?, ?)",
+                (self.owner_email, hash_password("owner-password-for-tests"), "Owner", "2026-01-01T00:00:00+00:00"),
+            )
+            self.owner_id = cursor.lastrowid
+            db.commit()
+            self.owner = db.execute("SELECT * FROM users WHERE id = ?", (self.owner_id,)).fetchone()
+        self.inviter_patch = patch("app.main.INVITER_EMAILS", {self.owner_email})
+        self.inviter_patch.start()
+
+    def tearDown(self) -> None:
+        self.inviter_patch.stop()
+        with db_lock:
+            db.execute("DELETE FROM users WHERE id = ?", (self.owner_id,))
+            db.commit()
+
+    def make_invite(self, email: str | None = None) -> tuple[str, str]:
+        email = email or self.friend_email
+        result = create_invitation(InvitationCreate(email=email), self.owner, origin=self.origin)
+        fragment = parse_qs(urlparse(result["invite_url"]).fragment)
+        return fragment["invite"][0], result["email"]
+
+    def test_invited_registration_is_private_and_automatically_signs_in(self) -> None:
+        token, email = self.make_invite()
+
+        class RecordingResponse:
+            cookies: dict[str, tuple[str, dict]] = {}
+
+            def set_cookie(self, name, value, **kwargs) -> None:
+                self.cookies[name] = (value, kwargs)
+
+        response = RecordingResponse()
+        result = register(
+            RegisterRequest(
+                email=email,
+                display_name="Kampala IT Graduate",
+                password="a-long-test-password",
+                invite_token=token,
+            ),
+            response,
+            origin=self.origin,
+        )
+
+        self.assertEqual(result["user"]["email"], email)
+        self.assertFalse(result["user"]["can_invite"])
+        self.assertEqual(result["user"]["workspace_title"], "My Job Desk")
+        self.assertIn("session", response.cookies)
+        self.assertTrue(response.cookies["session"][1]["httponly"])
+        workspace = me(db.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone())
+        self.assertEqual(workspace["profile"]["name"], "Kampala IT Graduate")
+        self.assertEqual(workspace["profile"]["target_roles"], [])
+        self.assertEqual(workspace["user"]["email"], email)
+        with db_lock:
+            invitation = db.execute(
+                "SELECT accepted_at, token_hash FROM invitations WHERE email = ?", (email,)
+            ).fetchone()
+        self.assertIsNotNone(invitation["accepted_at"])
+        self.assertNotEqual(invitation["token_hash"], token)
+        self.assertIsNotNone(db.execute("SELECT 1 FROM sessions WHERE user_id = ?", (result["user"]["id"],)).fetchone())
+
+    def test_invites_are_owner_only_and_origin_checked(self) -> None:
+        with patch("app.main.INVITER_EMAILS", set()):
+            with self.assertRaises(Exception) as unauthorized:
+                create_invitation(InvitationCreate(email=self.friend_email), self.owner, origin=self.origin)
+            self.assertEqual(unauthorized.exception.status_code, 403)
+
+        with self.assertRaises(Exception) as wrong_origin:
+            create_invitation(InvitationCreate(email=self.friend_email), self.owner, origin="https://attacker.test")
+        self.assertEqual(wrong_origin.exception.status_code, 403)
+
+    def test_invite_is_single_use_and_cannot_be_used_from_another_origin(self) -> None:
+        token, email = self.make_invite()
+        payload = RegisterRequest(email=email, display_name="Friend", password="a-long-test-password", invite_token=token)
+        with self.assertRaises(Exception) as wrong_origin:
+            register(payload, object(), origin="https://attacker.test")
+        self.assertEqual(wrong_origin.exception.status_code, 403)
+
+        register(payload, type("Response", (), {"set_cookie": lambda *args, **kwargs: None})(), origin=self.origin)
+        with self.assertRaises(Exception) as reused:
+            register(payload, type("Response", (), {"set_cookie": lambda *args, **kwargs: None})(), origin=self.origin)
+        self.assertEqual(reused.exception.status_code, 400)
+
+    def test_expired_invite_is_rejected(self) -> None:
+        token, email = self.make_invite()
+        with db_lock:
+            db.execute(
+                "UPDATE invitations SET expires_at = ? WHERE token_hash = ?",
+                ("2000-01-01T00:00:00+00:00", session_hash(token)),
+            )
+            db.commit()
+        payload = RegisterRequest(email=email, display_name="Friend", password="a-long-test-password", invite_token=token)
+        with self.assertRaises(Exception) as expired:
+            register(payload, object(), origin=self.origin)
+        self.assertEqual(expired.exception.status_code, 400)
 
 
 if __name__ == "__main__":
