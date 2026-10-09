@@ -205,9 +205,12 @@ class ProfileDrivenMatchingTests(unittest.TestCase):
     def test_kampala_it_graduate_matches_uganda_roles_and_location(self) -> None:
         match = listing(
             profile={
+                "target_roles": ["IT Support Assistant", "Help Desk Analyst", "Junior IT Technician"],
                 "target_industries": ["Information Technology"],
                 "target_locations": ["Kampala", "Uganda"],
                 "work_mode": "hybrid",
+                "education": "Recent Information Technology course graduate, Victoria University, Kampala",
+                "skills": "ICT troubleshooting, computer support, Windows, networking fundamentals",
             },
             title="IT Support Assistant - Graduate",
             company="Kampala Community Services",
