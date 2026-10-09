@@ -24,7 +24,7 @@ This is an extensible foundation, not a promise to index every employer, occupat
 
 There is no public self-registration. The bootstrap account (or an address explicitly listed in `INVITER_EMAILS`) can create an invitation from the PWA. Links are single-use, expire after seven days by default, and are bound to the email entered by the inviter. The PWA sends no email; share the generated link directly and privately. The token is carried in the URL fragment and only its hash is stored by the API.
 
-Set `APP_ORIGIN` to the exact PWA origin for CORS and invite-origin checks. Set `INVITE_BASE_URL` to the PWA's public base URL (it falls back to the first `APP_ORIGIN`). Leave `INVITER_EMAILS` empty to allow only `BOOTSTRAP_EMAIL` to invite. New accounts start with a blank profile and their own user-scoped saved roles, application drafts, and documents. Passwords must be at least 12 characters.
+Set `APP_ORIGIN` to the exact PWA origin for CORS and invite-origin checks; separate multiple allowed origins (for example, a preview plus production) with commas. Keep `INVITE_BASE_URL` pointed at the stable PWA address you intend invitees to use. Set `INVITE_BASE_URL` to the PWA's public base URL (it falls back to the first `APP_ORIGIN`). Leave `INVITER_EMAILS` empty to allow only `BOOTSTRAP_EMAIL` to invite. New accounts start with a blank profile and their own user-scoped saved roles, application drafts, and documents. Passwords must be at least 12 characters.
 
 The invite is a bearer link: anyone who receives it can claim it for the email it names, so do not forward it. An owner can issue a replacement link, which invalidates the previous unused link.
 
