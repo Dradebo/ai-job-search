@@ -40,9 +40,10 @@ COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "lax")
 BOOTSTRAP_EMAIL = os.getenv("BOOTSTRAP_EMAIL", "").strip().lower()
 BOOTSTRAP_PASSWORD = os.getenv("BOOTSTRAP_PASSWORD", "")
 INVITE_BASE_URL = os.getenv("INVITE_BASE_URL", "").strip().rstrip("/")
+INVITER_EMAILS_CONFIG = os.getenv("INVITER_EMAILS", "").strip()
 INVITER_EMAILS = {
     email.strip().lower()
-    for email in os.getenv("INVITER_EMAILS", BOOTSTRAP_EMAIL).split(",")
+    for email in (INVITER_EMAILS_CONFIG or BOOTSTRAP_EMAIL).split(",")
     if email.strip()
 }
 AI_JOB_SEARCH_ROOT = Path(os.getenv("AI_JOB_SEARCH_ROOT", "/engines/ai-job-search"))
@@ -986,6 +987,9 @@ def create_invitation(
     email = payload.email.strip().lower()
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    base_url = INVITE_BASE_URL or (APP_ORIGINS[0] if APP_ORIGINS else "")
+    if not base_url:
+        raise HTTPException(status_code=500, detail="The invite link address is not configured.")
 
     token = secrets.token_urlsafe(32)
     created_at = datetime.now(timezone.utc)
@@ -1005,9 +1009,6 @@ def create_invitation(
         )
         db.commit()
 
-    base_url = INVITE_BASE_URL or (APP_ORIGINS[0] if APP_ORIGINS else "")
-    if not base_url:
-        raise HTTPException(status_code=500, detail="The invite link address is not configured.")
     return {
         "email": email,
         "invite_url": f"{base_url}/#invite={token}&email={quote(email, safe='')}",
