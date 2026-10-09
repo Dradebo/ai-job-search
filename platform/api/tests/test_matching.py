@@ -293,7 +293,7 @@ class ProfileDrivenMatchingTests(unittest.TestCase):
 
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["source"], "USAJOBS")
-        self.assertIn("United States", matches[0]["location"])
+        self.assertIn("Atlanta, Georgia", matches[0]["location"])
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_header("Authorization-key"), "synthetic-api-key")
         self.assertEqual(request.get_header("User-agent"), "applicant@example.org")
