@@ -453,6 +453,8 @@ def industry_matches(profile: dict[str, Any], title: str, body: str, company: st
         "education": ("school", "teaching", "teacher", "learning", "university"),
         "finance": ("accounting", "accountant", "banking", "investment", "financial services"),
         "technology": ("software", "information technology", "digital technology"),
+        "information technology": ("ict", "computer support", "technical support", "software"),
+        "ict": ("information technology", "computer support", "technical support", "software"),
         "government": ("public sector", "federal agency", "state agency", "public administration"),
         "nonprofit": ("non-profit", "non profit", "ngo", "charity", "foundation"),
     }
