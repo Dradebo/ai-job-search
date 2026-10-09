@@ -13,11 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus, urlencode
+from urllib.parse import quote, quote_plus, urlencode
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Response, UploadFile, status
+from fastapi import Cookie, Depends, FastAPI, File, Header, HTTPException, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -39,6 +39,12 @@ COOKIE_SECURE = os.getenv("COOKIE_SECURE", "false").lower() == "true"
 COOKIE_SAMESITE = os.getenv("COOKIE_SAMESITE", "lax")
 BOOTSTRAP_EMAIL = os.getenv("BOOTSTRAP_EMAIL", "").strip().lower()
 BOOTSTRAP_PASSWORD = os.getenv("BOOTSTRAP_PASSWORD", "")
+INVITE_BASE_URL = os.getenv("INVITE_BASE_URL", "").strip().rstrip("/")
+INVITER_EMAILS = {
+    email.strip().lower()
+    for email in os.getenv("INVITER_EMAILS", BOOTSTRAP_EMAIL).split(",")
+    if email.strip()
+}
 AI_JOB_SEARCH_ROOT = Path(os.getenv("AI_JOB_SEARCH_ROOT", "/engines/ai-job-search"))
 CAREER_OPS_ROOT = Path(os.getenv("CAREER_OPS_ROOT", "/engines/career-ops"))
 DISCOVERY_TIMEOUT_SECONDS = float(os.getenv("DISCOVERY_TIMEOUT_SECONDS", "6"))
@@ -81,6 +87,16 @@ def init_db() -> None:
                 token_hash TEXT PRIMARY KEY,
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 expires_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS invitations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                created_by INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                accepted_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS jobs (
@@ -181,6 +197,41 @@ def session_hash(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def require_allowed_origin(origin: str | None) -> None:
+    if not origin or origin.rstrip("/") not in APP_ORIGINS:
+        raise HTTPException(status_code=403, detail="This request did not come from the job desk.")
+
+
+def set_session_cookie(response: Response, user_id: int) -> None:
+    token = secrets.token_urlsafe(32)
+    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    with db_lock:
+        db.execute(
+            "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+            (session_hash(token), user_id, expires_at.isoformat()),
+        )
+        db.commit()
+    response.set_cookie(
+        "session",
+        token,
+        httponly=True,
+        secure=COOKIE_SECURE,
+        samesite=COOKIE_SAMESITE,
+        max_age=SESSION_DAYS * 86400,
+    )
+
+
+def user_summary(user: sqlite3.Row) -> dict[str, Any]:
+    email = user["email"].strip().lower()
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "display_name": user["display_name"],
+        "can_invite": email in INVITER_EMAILS,
+        "workspace_title": "Mum's Job Desk" if email == BOOTSTRAP_EMAIL else "My Job Desk",
+    }
+
+
 def current_user(session: str | None) -> sqlite3.Row:
     if not session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sign in required")
@@ -205,6 +256,18 @@ def user_dependency(session: str | None = Cookie(default=None)) -> sqlite3.Row:
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=8, max_length=200)
+
+
+class InvitationCreate(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    expires_in_days: int = Field(default=7, ge=1, le=30)
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    display_name: str = Field(min_length=1, max_length=160)
+    password: str = Field(min_length=12, max_length=200)
+    invite_token: str = Field(min_length=32, max_length=128)
 
 
 class ProfileUpdate(BaseModel):
@@ -910,21 +973,101 @@ def health() -> dict[str, Any]:
     return {"ok": True, "service": "ai-job-search-api"}
 
 
-@app.post("/api/v1/auth/login")
-def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
-    with db_lock:
-        user = db.execute("SELECT * FROM users WHERE email = ?", (payload.email.strip().lower(),)).fetchone()
-    if user is None or not verify_password(payload.password, user["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Email or password is incorrect")
+@app.post("/api/v1/invitations")
+def create_invitation(
+    payload: InvitationCreate,
+    user: sqlite3.Row = Depends(user_dependency),
+    origin: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_allowed_origin(origin)
+    if user["email"].strip().lower() not in INVITER_EMAILS:
+        raise HTTPException(status_code=403, detail="Only the job desk owner can invite someone.")
+
+    email = payload.email.strip().lower()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
 
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)
+    created_at = datetime.now(timezone.utc)
+    expires_at = created_at + timedelta(days=payload.expires_in_days)
     with db_lock:
+        existing_user = db.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if existing_user:
+            raise HTTPException(status_code=409, detail="An account already exists for that email.")
+        # A new link for the same address invalidates any older, unused link.
         db.execute(
-            "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
-            (session_hash(token), user["id"], expires_at.isoformat()),
+            "DELETE FROM invitations WHERE email = ? AND accepted_at IS NULL",
+            (email,),
+        )
+        db.execute(
+            "INSERT INTO invitations (email, token_hash, created_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
+            (email, session_hash(token), user["id"], created_at.isoformat(), expires_at.isoformat()),
         )
         db.commit()
+
+    base_url = INVITE_BASE_URL or (APP_ORIGINS[0] if APP_ORIGINS else "")
+    if not base_url:
+        raise HTTPException(status_code=500, detail="The invite link address is not configured.")
+    return {
+        "email": email,
+        "invite_url": f"{base_url}/#invite={token}&email={quote(email, safe='')}",
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@app.post("/api/v1/auth/register")
+def register(
+    payload: RegisterRequest,
+    response: Response,
+    origin: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_allowed_origin(origin)
+    email = payload.email.strip().lower()
+    display_name = payload.display_name.strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise HTTPException(status_code=422, detail="Enter a valid email address.")
+    if not display_name:
+        raise HTTPException(status_code=422, detail="Enter your name.")
+
+    now = datetime.now(timezone.utc)
+    token = secrets.token_urlsafe(32)
+    profile = ProfileUpdate(name=display_name).model_dump()
+    with db_lock:
+        db.execute("BEGIN IMMEDIATE")
+        invitation = db.execute(
+            "SELECT id FROM invitations WHERE email = ? AND token_hash = ? AND accepted_at IS NULL AND expires_at > ?",
+            (email, session_hash(payload.invite_token), now.isoformat()),
+        ).fetchone()
+        if invitation is None:
+            db.rollback()
+            raise HTTPException(status_code=400, detail="This invite is invalid, expired, or already used.")
+        if db.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
+            db.rollback()
+            raise HTTPException(status_code=409, detail="An account already exists for that email.")
+        try:
+            user_id = db.execute(
+                "INSERT INTO users (email, password_hash, display_name, created_at) VALUES (?, ?, ?, ?)",
+                (email, hash_password(payload.password), display_name, now.isoformat()),
+            ).lastrowid
+            db.execute(
+                "INSERT INTO profiles (user_id, profile_json, updated_at) VALUES (?, ?, ?)",
+                (user_id, json.dumps(profile), now.isoformat()),
+            )
+            consumed = db.execute(
+                "UPDATE invitations SET accepted_at = ? WHERE id = ? AND accepted_at IS NULL",
+                (now.isoformat(), invitation["id"]),
+            )
+            if consumed.rowcount != 1:
+                raise HTTPException(status_code=400, detail="This invite is invalid, expired, or already used.")
+            db.execute(
+                "INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)",
+                (session_hash(token), user_id, (now + timedelta(days=SESSION_DAYS)).isoformat()),
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
     response.set_cookie(
         "session",
         token,
@@ -933,7 +1076,19 @@ def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
         samesite=COOKIE_SAMESITE,
         max_age=SESSION_DAYS * 86400,
     )
-    return {"user": {"id": user["id"], "email": user["email"], "display_name": user["display_name"]}}
+    with db_lock:
+        created_user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    return {"user": user_summary(created_user)}
+
+
+@app.post("/api/v1/auth/login")
+def login(payload: LoginRequest, response: Response) -> dict[str, Any]:
+    with db_lock:
+        user = db.execute("SELECT * FROM users WHERE email = ?", (payload.email.strip().lower(),)).fetchone()
+    if user is None or not verify_password(payload.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Email or password is incorrect")
+    set_session_cookie(response, user["id"])
+    return {"user": user_summary(user)}
 
 
 @app.post("/api/v1/auth/logout")
@@ -951,7 +1106,7 @@ def me(user: sqlite3.Row = Depends(user_dependency)) -> dict[str, Any]:
     with db_lock:
         profile = db.execute("SELECT profile_json FROM profiles WHERE user_id = ?", (user["id"],)).fetchone()
     return {
-        "user": {"id": user["id"], "email": user["email"], "display_name": user["display_name"]},
+        "user": user_summary(user),
         "profile": json.loads(profile["profile_json"]) if profile else {},
     }
 
