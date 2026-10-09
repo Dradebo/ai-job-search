@@ -44,6 +44,8 @@ CAREER_OPS_ROOT = Path(os.getenv("CAREER_OPS_ROOT", "/engines/career-ops"))
 DISCOVERY_TIMEOUT_SECONDS = float(os.getenv("DISCOVERY_TIMEOUT_SECONDS", "6"))
 DISCOVERY_MAX_RESULTS = int(os.getenv("DISCOVERY_MAX_RESULTS", "60"))
 GREENHOUSE_MAX_BOARDS = int(os.getenv("GREENHOUSE_MAX_BOARDS", "12"))
+USAJOBS_API_KEY = os.getenv("USAJOBS_API_KEY", "").strip()
+USAJOBS_USER_AGENT = os.getenv("USAJOBS_USER_AGENT", "").strip()
 
 db_lock = threading.Lock()
 db = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
@@ -440,14 +442,33 @@ def industry_matches(profile: dict[str, Any], title: str, body: str, company: st
     if not isinstance(industries, list) or not industries:
         return True
     listing_text = normalized_words(f"{title} {body} {company}")
+    listing_terms = set(search_terms(listing_text))
+    industry_aliases = {
+        "public health": (
+            "epidemiology", "epidemiologist", "biostatistics", "biostatistician",
+            "population health", "community health", "global health", "health policy",
+            "health equity", "health outcomes", "disease surveillance",
+        ),
+        "healthcare": ("hospital", "clinical", "nursing", "patient care", "medical", "health system"),
+        "education": ("school", "teaching", "teacher", "learning", "university"),
+        "finance": ("accounting", "accountant", "banking", "investment", "financial services"),
+        "technology": ("software", "information technology", "digital technology"),
+        "government": ("public sector", "federal agency", "state agency", "public administration"),
+        "nonprofit": ("non-profit", "non profit", "ngo", "charity", "foundation"),
+    }
     for industry in industries:
-        terms = search_terms(clean_text(industry))
-        if contains_phrase(listing_text, industry):
-            return True
-        if terms and len(terms) > 1 and sum(term in set(search_terms(listing_text)) for term in terms) >= (len(terms) + 1) // 2:
-            return True
-        if terms and len(terms) == 1 and terms[0] in set(search_terms(listing_text)):
-            return True
+        industry_text = normalized_words(clean_text(industry))
+        candidates = [industry_text, *industry_aliases.get(industry_text, ())]
+        for candidate in candidates:
+            terms = search_terms(candidate)
+            if contains_phrase(listing_text, candidate):
+                return True
+            # Multi-word filters require the full concept; matching just one
+            # generic word (e.g. "health") caused unrelated listings to pass.
+            if terms and len(terms) > 1 and all(term in listing_terms for term in terms):
+                return True
+            if terms and len(terms) == 1 and terms[0] in listing_terms:
+                return True
     return False
 
 
@@ -509,20 +530,15 @@ def fetch_json(url: str) -> Any:
 
 
 def configured_greenhouse_sources() -> list[tuple[str, str]]:
-    config_path = CAREER_OPS_ROOT / "templates" / "portals.example.yml"
-    try:
-        config = config_path.read_text(encoding="utf-8")
-    except OSError:
-        return []
     sources: list[tuple[str, str]] = []
     seen: set[str] = set()
-    for api_url, token in re.findall(
-        r"api:\s+(https://boards-api(?:\.eu)?\.greenhouse\.io/v1/boards/([^/]+)/jobs)",
-        config,
-    ):
-        if api_url not in seen:
-            sources.append((token, api_url + "?content=true"))
-            seen.add(api_url)
+    # Do not treat a tool's example config as a job-source catalog: examples
+    # are often narrow (the mounted CareerOps sample is AI/tech-heavy).
+    for token in os.getenv("GREENHOUSE_BOARDS", "").split(","):
+        token = token.strip()
+        if token and re.fullmatch(r"[A-Za-z0-9-]+", token) and token.lower() not in seen:
+            sources.append((token, f"https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"))
+            seen.add(token.lower())
     return sources[:GREENHOUSE_MAX_BOARDS]
 
 
@@ -624,6 +640,85 @@ def search_jobicy(
     return [result for result in results if result]
 
 
+def search_usajobs(
+    query: str,
+    location: str,
+    work_mode: str,
+    profile: dict[str, Any],
+    target_roles: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Search USAJOBS when the operator has configured its official API credentials."""
+    if not USAJOBS_API_KEY or not USAJOBS_USER_AGENT:
+        return []
+    results: list[dict[str, Any] | None] = []
+    for role in target_roles or [query]:
+        params = urlencode({
+            "PositionTitle": role[:120],
+            "WhoMayApply": "public",
+            "ResultsPerPage": "50",
+            "Fields": "Full",
+        })
+        request = Request(
+            "https://data.usajobs.gov/api/Search?" + params,
+            headers={
+                "Accept": "application/json",
+                "Host": "data.usajobs.gov",
+                "User-Agent": USAJOBS_USER_AGENT,
+                "Authorization-Key": USAJOBS_API_KEY,
+            },
+        )
+        with urlopen(request, timeout=DISCOVERY_TIMEOUT_SECONDS) as response:
+            data = json.load(response)
+        items = (data.get("SearchResult") or {}).get("SearchResultItems", [])
+        for item in items:
+            raw = item.get("MatchedObjectDescriptor") or {}
+            locations = raw.get("PositionLocation") or []
+            if isinstance(locations, dict):
+                locations = [locations]
+            location_names = [
+                clean_text(entry.get("LocationName") or entry.get("Name") or "")
+                for entry in locations if isinstance(entry, dict)
+            ]
+            listing_location = ", ".join(name for name in location_names if name)
+            if not listing_location:
+                listing_location = "United States"
+            elif not is_us_eligible(listing_location):
+                listing_location += ", United States"
+            details = (raw.get("UserArea") or {}).get("Details") or {}
+            formatted = raw.get("PositionFormattedDescription") or []
+            if isinstance(formatted, dict):
+                formatted = [formatted]
+            body_parts = [raw.get("QualificationSummary", "")]
+            body_parts.extend(
+                entry.get("Content", "") for entry in formatted if isinstance(entry, dict)
+            )
+            body_parts.extend(
+                value for value in details.values() if isinstance(value, str)
+            )
+            body = " ".join(clean_text(part) for part in body_parts if part)
+            remote_indicator = raw.get("RemoteIndicator") or details.get("RemoteJobIndicator")
+            if isinstance(remote_indicator, str):
+                remote_indicator = remote_indicator.strip().lower() == "true"
+            if remote_indicator:
+                listing_location = "Remote - United States"
+                body = "Remote position. " + body
+            apply_uri = raw.get("ApplyURI") or raw.get("PositionURI")
+            if isinstance(apply_uri, list):
+                apply_uri = next((value for value in apply_uri if isinstance(value, str)), "")
+            results.append(normalize_listing(
+                provider="USAJOBS",
+                external_id=raw.get("PositionID") or item.get("MatchedObjectId"),
+                title=raw.get("PositionTitle"),
+                company=raw.get("OrganizationName") or raw.get("DepartmentName"),
+                url=apply_uri,
+                location=listing_location,
+                body=body,
+                role_queries=[role],
+                profile=profile,
+            ))
+    return [result for result in results if result]
+
+
 def search_himalayas(
     query: str,
     location: str,
@@ -698,6 +793,8 @@ def discover_jobs(role_queries: list[str], location: str, work_mode: str, profil
         tasks[f"Jobicy:{role}"] = lambda role=role: search_jobicy(role, location, work_mode, search_profile, role_queries)
         tasks[f"Himalayas:{role}"] = lambda role=role: search_himalayas(role, location, work_mode, search_profile, role_queries)
         tasks[f"Remotive:{role}"] = lambda role=role: search_remotive(role, location, work_mode, search_profile, role_queries)
+        if USAJOBS_API_KEY and USAJOBS_USER_AGENT:
+            tasks[f"USAJOBS:{role}"] = lambda role=role: search_usajobs(role, location, work_mode, search_profile, [role])
     sources = configured_greenhouse_sources()
     for source in sources:
         tasks[f"Greenhouse:{source[0]}"] = lambda source=source: search_greenhouse_board(source, role_queries, search_profile)
@@ -972,11 +1069,17 @@ def search(payload: SearchRequest, user: sqlite3.Row = Depends(user_dependency))
     persisted = persist_discovered_jobs(user["id"], matches)
     archive_irrelevant_discoveries(user["id"], role_queries, search_profile)
     return {
-        "provider": "public-job-feeds-and-career-ops-greenhouse",
+        "provider": "public-job-feeds-and-configured-employer-boards",
         "query": search_query,
         "message": "Results are filtered against your selected roles, industries, locations, and work preference. Check each employer's eligibility requirements before preparing an application.",
         "matches": persisted,
         "warnings": warnings,
+        "automated_sources": [
+            "Jobicy (remote jobs)", "Himalayas (remote jobs)", "Remotive (remote jobs)",
+            *([f"Greenhouse employer boards ({len(configured_greenhouse_sources())})"] if configured_greenhouse_sources() else []),
+            *(["USAJOBS (public federal listings)"] if USAJOBS_API_KEY and USAJOBS_USER_AGENT else []),
+        ],
+        "coverage_note": "This is not a web-wide job index. Automated matching uses the public feeds and employer boards configured for this service; Google Jobs and LinkedIn links below broaden the search. USAJOBS matching needs operator-configured API credentials.",
         "engine_checks": {
             "career_ops": (CAREER_OPS_ROOT / "templates" / "portals.example.yml").is_file(),
             "ai_job_search": (AI_JOB_SEARCH_ROOT / ".claude" / "skills" / "job-scraper" / "SKILL.md").is_file(),
