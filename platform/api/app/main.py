@@ -542,6 +542,19 @@ def configured_greenhouse_sources() -> list[tuple[str, str]]:
     return sources[:GREENHOUSE_MAX_BOARDS]
 
 
+def automated_source_labels(work_mode: str) -> list[str]:
+    mode = clean_text(work_mode).lower().replace("_", "-")
+    sources: list[str] = []
+    if mode not in {"on-site", "onsite", "on site"}:
+        sources.extend(["Jobicy (remote jobs)", "Himalayas (remote jobs)", "Remotive (remote jobs)"])
+    boards = configured_greenhouse_sources()
+    if boards:
+        sources.append(f"Greenhouse employer boards ({len(boards)})")
+    if USAJOBS_API_KEY and USAJOBS_USER_AGENT:
+        sources.append("USAJOBS (public federal listings)")
+    return sources
+
+
 def score_listing(title: str, body: str, matched_role: str, profile: dict[str, Any]) -> tuple[float, str, str]:
     terms = [term for term in search_terms(matched_role) if term not in GENERIC_ROLE_WORDS]
     title_text = clean_text(title).lower()
@@ -789,10 +802,12 @@ def discover_jobs(role_queries: list[str], location: str, work_mode: str, profil
     elif search_profile.get("work_mode") in {None, ""}:
         search_profile["work_mode"] = "any"
     tasks = {}
+    remote_sources_eligible = clean_text(work_mode).lower().replace("_", "-") not in {"on-site", "onsite", "on site"}
     for role in role_queries:
-        tasks[f"Jobicy:{role}"] = lambda role=role: search_jobicy(role, location, work_mode, search_profile, role_queries)
-        tasks[f"Himalayas:{role}"] = lambda role=role: search_himalayas(role, location, work_mode, search_profile, role_queries)
-        tasks[f"Remotive:{role}"] = lambda role=role: search_remotive(role, location, work_mode, search_profile, role_queries)
+        if remote_sources_eligible:
+            tasks[f"Jobicy:{role}"] = lambda role=role: search_jobicy(role, location, work_mode, search_profile, role_queries)
+            tasks[f"Himalayas:{role}"] = lambda role=role: search_himalayas(role, location, work_mode, search_profile, role_queries)
+            tasks[f"Remotive:{role}"] = lambda role=role: search_remotive(role, location, work_mode, search_profile, role_queries)
         if USAJOBS_API_KEY and USAJOBS_USER_AGENT:
             tasks[f"USAJOBS:{role}"] = lambda role=role: search_usajobs(role, location, work_mode, search_profile, [role])
     sources = configured_greenhouse_sources()
@@ -1074,11 +1089,7 @@ def search(payload: SearchRequest, user: sqlite3.Row = Depends(user_dependency))
         "message": "Results are filtered against your selected roles, industries, locations, and work preference. Check each employer's eligibility requirements before preparing an application.",
         "matches": persisted,
         "warnings": warnings,
-        "automated_sources": [
-            "Jobicy (remote jobs)", "Himalayas (remote jobs)", "Remotive (remote jobs)",
-            *([f"Greenhouse employer boards ({len(configured_greenhouse_sources())})"] if configured_greenhouse_sources() else []),
-            *(["USAJOBS (public federal listings)"] if USAJOBS_API_KEY and USAJOBS_USER_AGENT else []),
-        ],
+        "automated_sources": automated_source_labels(work_mode),
         "coverage_note": "This is not a web-wide job index. Automated matching uses the public feeds and employer boards configured for this service; Google Jobs and LinkedIn links below broaden the search. USAJOBS matching needs operator-configured API credentials.",
         "engine_checks": {
             "career_ops": (CAREER_OPS_ROOT / "templates" / "portals.example.yml").is_file(),
