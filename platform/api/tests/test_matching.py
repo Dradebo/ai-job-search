@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import sys
+import io
+import json
 from types import ModuleType
 import unittest
 from unittest.mock import patch
@@ -68,7 +70,13 @@ except ModuleNotFoundError as error:
         "fastapi.responses": responses_module,
     })
 
-from app.main import normalize_listing, search_himalayas, search_jobicy  # noqa: E402
+from app.main import (  # noqa: E402
+    configured_greenhouse_sources,
+    normalize_listing,
+    search_himalayas,
+    search_jobicy,
+    search_usajobs,
+)
 
 
 def listing(
@@ -226,6 +234,71 @@ class ProfileDrivenMatchingTests(unittest.TestCase):
 
         self.assertIsNone(with_industry)
         self.assertIsNotNone(without_industry)
+
+    def test_public_health_filter_understands_related_occupations_without_loose_word_matches(self) -> None:
+        epidemiologist = listing(
+            profile={"target_industries": ["Public health"], "work_mode": "any"},
+            title="Epidemiologist",
+            company="County Department",
+            location="Baltimore, Maryland",
+            body="Analyze outbreak data and support disease surveillance.",
+            role="Epidemiologist",
+        )
+        unrelated_program_manager = listing(
+            profile={"target_industries": ["Public health"], "work_mode": "any"},
+            title="Program Manager",
+            company="AI Product Lab",
+            location="Remote - United States",
+            body="Manage a software program and report on product health metrics.",
+            role="Program Manager",
+        )
+
+        self.assertIsNotNone(epidemiologist)
+        self.assertIsNone(unrelated_program_manager)
+
+    @patch.dict(os.environ, {"GREENHOUSE_BOARDS": "cdc, world-bank, cdc, bad/slug"})
+    def test_greenhouse_sources_come_only_from_explicit_board_configuration(self) -> None:
+        sources = configured_greenhouse_sources()
+
+        self.assertEqual([slug for slug, _ in sources], ["cdc", "world-bank"])
+        self.assertTrue(all("boards-api.greenhouse.io/v1/boards/" in url for _, url in sources))
+
+    @patch("app.main.urlopen")
+    @patch("app.main.USAJOBS_USER_AGENT", "applicant@example.org")
+    @patch("app.main.USAJOBS_API_KEY", "synthetic-api-key")
+    def test_usajobs_adapter_uses_credentials_and_normalizes_federal_listings(self, urlopen) -> None:
+        payload = {
+            "SearchResult": {
+                "SearchResultItems": [{
+                    "MatchedObjectId": "12345",
+                    "MatchedObjectDescriptor": {
+                        "PositionID": "CDC-12345",
+                        "PositionTitle": "Biostatistician",
+                        "PositionURI": "https://www.usajobs.gov/job/12345",
+                        "ApplyURI": ["https://www.usajobs.gov/apply/12345"],
+                        "OrganizationName": "Centers for Disease Control and Prevention",
+                        "PositionLocation": [{"LocationName": "Atlanta, Georgia"}],
+                        "QualificationSummary": "Support public health research using statistical methods.",
+                    },
+                }],
+            },
+        }
+        urlopen.return_value = io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+        matches = search_usajobs(
+            "Biostatistician", "", "any",
+            {"target_industries": ["Public health"], "target_locations": ["United States"], "work_mode": "any"},
+            ["Biostatistician"],
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["source"], "USAJOBS")
+        self.assertIn("United States", matches[0]["location"])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_header("Authorization-key"), "synthetic-api-key")
+        self.assertEqual(request.get_header("User-agent"), "applicant@example.org")
+        parameters = parse_qs(urlparse(request.full_url).query)
+        self.assertEqual(parameters["WhoMayApply"], ["public"])
 
     def test_no_location_preference_does_not_impose_a_us_only_filter(self) -> None:
         match = listing(
