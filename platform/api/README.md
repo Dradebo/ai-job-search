@@ -1,6 +1,6 @@
 # Hosted API
 
-This FastAPI service provides the private profile, document, saved-role, application-draft, and job-discovery endpoints used by the PWA in the separate `Dradebo/nextjs-boilerplate` repository.
+This FastAPI service provides the profile, document, saved-role, application-draft, and job-discovery endpoints used by the PWA in the separate `Dradebo/nextjs-boilerplate` repository.
 
 ## Local checks
 
@@ -10,12 +10,14 @@ From this directory, install `requirements.txt` and run:
 python -m unittest discover -s tests -v
 ```
 
-The suite uses synthetic applicants and postings across public health, technology, education, and finance in the United States, United Kingdom, Kenya, and Canada. It makes no network requests.
+The synthetic suite covers public health, healthcare, technology, education, and finance roles across the United States, United Kingdom, Kenya, and Canada. It makes no network requests.
 
-## Discovery scope
+## Matching and source coverage
 
-Matching is driven by the user's role, optional industry, location, and work-mode preferences. Empty location or industry preferences do not impose a U.S.-only or healthcare-only restriction. Existing `remote-US` profile values remain supported.
+Matching is profile-driven: roles, optional industries, locations, and work modes are applied to listings from every provider. Empty industry or location preferences do not impose healthcare or U.S.-only filters. Public-health matching recognizes closely related work such as epidemiology, biostatistics, population health, and disease surveillance. Industry aliases are hints; applicants should still review each posting and its eligibility requirements.
 
-The current automated feeds are Jobicy, Himalayas, Remotive, and a limited Greenhouse board list read from the mounted CareerOps example configuration. That example list is AI/technology-heavy and is not a comprehensive job index; use a broader, maintained source registry before promising coverage for any specific occupation or country. Search links remain available as additional sources.
+The default automated feeds (Jobicy, Himalayas, Remotive) are remote-only and are not a comprehensive job index. Greenhouse boards are read only from the explicit `GREENHOUSE_BOARDS` environment variable (comma-separated board slugs); the CareerOps example config is deliberately not used as a production catalog. USAJOBS matching is enabled only when both `USAJOBS_API_KEY` and `USAJOBS_USER_AGENT` are configured. See `.env.example` and the [official USAJOBS API reference](https://developer.usajobs.gov/api-reference/job-apis). Google Jobs and LinkedIn search links remain available as broader discovery fallbacks.
 
-There is no public registration endpoint. The API remains bootstrap-account/invite controlled, and applications are prepared as drafts for human review; it does not submit applications or send email automatically.
+This is an extensible foundation, not a promise to index every employer, occupation, country, or job board. Broader coverage requires selecting compliant feeds or maintaining additional source adapters and, where required, obtaining the providers' credentials.
+
+There is no public self-registration endpoint. Account creation remains bootstrap/invite controlled, and applications are prepared as drafts for human review; the service does not send email or submit applications automatically.
